@@ -25,10 +25,10 @@ from avalanche.evaluation.metrics import (
     accuracy_metrics, loss_metrics, forgetting_metrics
 )
 from avalanche.logging import InteractiveLogger
-from avalanche.training.supervised import Naive
-from avalanche.evaluation import EvaluationPlugin
+from avalanche.training.plugins import EvaluationPlugin
 
 from plugin import E2DReplayPlugin
+from teacher import load_cifar_teacher
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -111,6 +111,9 @@ def main():
     parser.add_argument("--strategy",       type=str,   default="all",
                         choices=["all", "naive", "random", "e2d"],
                         help="Which strategy to run")
+    parser.add_argument("--teacher-ckpt", type=str,
+                    default="./cifar_models/resnet50_cifar10_lr01.pth",
+                    help="Path to pretrained CIFAR-10 teacher checkpoint")
     args = parser.parse_args()
 
     device = torch.device(
@@ -169,13 +172,8 @@ def main():
 
     # ── 3. E2D Replay — our method ───────────────────────────────────────────
     if args.strategy in ("all", "e2d"):
-        # Teacher: pretrained ResNet-18 (ImageNet weights, frozen)
-        # For CIFAR you could also train a small model first, but ImageNet
-        # pretrained weights already give strong feature representations.
-        teacher = tv_models.resnet18(weights="IMAGENET1K_V1").to(device)
-        teacher.eval()
-        for p in teacher.parameters():
-            p.requires_grad_(False)
+        # Teacher: pretrained CIFAR-10 ResNet-50 teacher (CIFAR-10 weights, frozen)
+        teacher = load_cifar_teacher(device, args.teacher_ckpt)
 
         e2d_plugin = E2DReplayPlugin(
             teacher        = teacher,

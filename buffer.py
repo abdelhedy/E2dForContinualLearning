@@ -8,6 +8,7 @@ When new classes are added, the per-class budget is recalculated so the
 total number of stored images never exceeds `max_size`.
 """
 
+from matplotlib.pylab import sample
 import torch
 from torch.utils.data import TensorDataset
 from typing import Dict, List, Optional
@@ -68,27 +69,63 @@ class E2DBuffer:
             f"| total {self.total_images}/{self.max_size} "
             f"| budget {budget}/class across {total_classes} classes"
         )
-
     def get_dataset(self) -> Optional[TensorDataset]:
-        """
-        Return a TensorDataset (images, labels) of all synthetic images,
-        or None if the buffer is empty.
-        """
         if not self.data:
+            print("[Buffer] get_dataset called but buffer is empty")
             return None
 
-        all_imgs   = []
+        all_imgs = []
         all_labels = []
-        for class_id, imgs in self.data.items():
-            all_imgs.append(imgs)
-            all_labels.append(
-                torch.full((imgs.shape[0],), class_id, dtype=torch.long)
-            )
+        all_tasks = []
 
-        return TensorDataset(
-            torch.cat(all_imgs,   dim=0),
+        for class_id, imgs in self.data.items():
+            n = imgs.shape[0]
+            all_imgs.append(imgs)
+            all_labels.append(torch.full((n,), class_id, dtype=torch.long))
+            all_tasks.append(torch.zeros(n, dtype=torch.long))  # dummy task ids
+
+        dataset = TensorDataset(
+            torch.cat(all_imgs, dim=0),
             torch.cat(all_labels, dim=0),
+            torch.cat(all_tasks, dim=0),
         )
+
+        # 🔍 DEBUG LOGGING
+        print("\n[DEBUG][Buffer] Dataset created")
+        print(f"[DEBUG][Buffer] Total samples: {len(dataset)}")
+
+        sample = dataset[0]
+        print(f"[DEBUG][Buffer] Sample type: {type(sample)}")
+        print(f"[DEBUG][Buffer] Sample length: {len(sample)}")
+
+        for i, elem in enumerate(sample):
+            print(f"[DEBUG][Buffer] element[{i}] → type={type(elem)}, shape={getattr(elem, 'shape', None)}")
+
+        print()
+
+        return dataset
+
+    # def get_dataset(self) -> Optional[TensorDataset]:
+    #     """
+    #     Return a TensorDataset (images, labels) of all synthetic images,
+    #     or None if the buffer is empty.
+    #     """
+    #     if not self.data:
+    #         return None
+
+    #     all_imgs   = []
+    #     all_labels = []
+    #     for class_id, imgs in self.data.items():
+    #         all_imgs.append(imgs)
+    #         all_labels.append(
+    #             torch.full((imgs.shape[0],), class_id, dtype=torch.long)
+    #         )
+
+    #     return TensorDataset(
+    #         torch.cat(all_imgs,   dim=0),
+    #         torch.cat(all_labels, dim=0),
+    #     )
+    
 
     def get_class_images(self, class_id: int) -> Optional[torch.Tensor]:
         """Return the stored images for a single class, or None."""

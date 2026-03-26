@@ -10,6 +10,8 @@ before_training_exp : inject synthetic replay data into the dataloader
 after_training_exp  : distil the just-finished task and update the buffer
 """
 
+from random import sample
+
 import torch
 import numpy as np
 from torch.utils.data import DataLoader, ConcatDataset, TensorDataset
@@ -56,10 +58,10 @@ def _get_class_tensors(
 class _MergedDataset(torch.utils.data.Dataset):
     """
     Concatenates an Avalanche experience dataset (returns x, y, t)
-    with a synthetic TensorDataset (returns x, y).
+    with a synthetic TensorDataset (returns x, y, t).
 
-    All synthetic samples get task_label = 0 so Avalanche's internals
-    stay happy. This is fine because we only use a single-head classifier.
+    Synthetic samples are expected to return (x, y, t). If they only return
+    (x, y), a dummy task label 0 is added for compatibility.
     """
 
     def __init__(self, real_dataset, synthetic_dataset: TensorDataset):
@@ -73,10 +75,33 @@ class _MergedDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         if idx < self.real_len:
-            return self.real[idx]           # (x, y, task_label)
-        syn_idx       = idx - self.real_len
-        x, y          = self.synthetic[syn_idx]
-        return x, y, torch.tensor(0)        # fake task_label = 0
+            sample = self.real[idx]
+        else:
+            syn_idx = idx - self.real_len
+            sample = self.synthetic[syn_idx]
+
+        if len(sample) == 3:
+            x, y, t = sample
+        elif len(sample) == 2:
+            x, y = sample
+            t = 0
+        else:
+            raise ValueError(
+                f"Unexpected synthetic sample format: len={len(sample)}, sample={sample}"
+            )
+
+        # Force consistent types for DataLoader collation
+        if not torch.is_tensor(y):
+            y = torch.tensor(y, dtype=torch.long)
+        else:
+            y = y.long()
+
+        if not torch.is_tensor(t):
+            t = torch.tensor(t, dtype=torch.long)
+        else:
+            t = t.long()
+
+        return x, y, t
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -131,6 +156,19 @@ class E2DReplayPlugin(SupervisedPlugin):
             f"[E2DPlugin] Merging {len(syn_dataset)} synthetic images "
             f"with real data for replay."
         )
+        #debugging code 
+        print("\n[DEBUG][Avalanche] Inspecting adapted_dataset")
+
+        real_sample = strategy.adapted_dataset[0]
+
+        print(f"[DEBUG][Avalanche] Sample type: {type(real_sample)}")
+        print(f"[DEBUG][Avalanche] Sample length: {len(real_sample)}")
+
+        for i, elem in enumerate(real_sample):
+            print(f"[DEBUG][Avalanche] element[{i}] → type={type(elem)}, shape={getattr(elem, 'shape', None)}")
+
+        print()
+        #End of dubugging
         merged = _MergedDataset(
             strategy.adapted_dataset, syn_dataset
         )
