@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual environment
+.venv/
+venv/
+
+# Data (VERY IMPORTANT)
+data/
+*.tar.gz
+*.zip
+
+# Model checkpoints
+*.pth
+
+# OS/editor
+Thumbs.db
