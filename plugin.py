@@ -1,22 +1,7 @@
-"""Avalanche plugin for E2D synthetic replay — FIXED VERSION.
-
-Root cause of the original bug
---------------------------------
-before_training_exp() was setting strategy.dataloader directly.
-Avalanche calls make_train_dataloader() AFTER before_training_exp(),
-which rebuilds strategy.dataloader from scratch, silently discarding
-the merged dataloader. The result looked identical to Naive (no replay).
-
-Fix
----
-Override make_train_dataloader() instead. This hook IS the dataloader
-construction step — setting strategy.dataloader here is the last word.
-No Avalanche-version-specific dataset classes needed: we use plain
-PyTorch ConcatDataset + DataLoader, which works with any Avalanche version.
-"""
+"""Avalanche plugin for E2D synthetic replay."""
 
 from __future__ import annotations
-from typing import Set
+from typing import Set, List
 import torch
 from torch.utils.data import DataLoader, TensorDataset, ConcatDataset
 from avalanche.training.plugins.strategy_plugin import SupervisedPlugin
@@ -25,13 +10,32 @@ from buffer import E2DBuffer
 from distill import distill_task
 
 
+# ── Custom collate: handles mixed int/tensor labels from ConcatDataset ────────
+def _safe_collate(batch: List) -> tuple:
+    """
+    Avalanche datasets return labels as plain Python ints.
+    Synthetic datasets return labels as tensors.
+    This collate handles both so ConcatDataset batches don't crash.
+    """
+    xs, ys, ts = [], [], []
+    for item in batch:
+        x, y, t = item[0], item[1], item[2]
+        xs.append(x if torch.is_tensor(x) else torch.tensor(x))
+        ys.append(torch.tensor(y, dtype=torch.long)
+                  if not torch.is_tensor(y)
+                  else y.long())
+        ts.append(torch.tensor(t, dtype=torch.long)
+                  if not torch.is_tensor(t)
+                  else t.long())
+    return torch.stack(xs), torch.stack(ys), torch.stack(ts)
+
+
 def _get_class_tensors(
     dataset,
     class_id: int,
     device: torch.device,
     max_samples: int = 500,
 ) -> torch.Tensor:
-    """Collect up to max_samples real images for a given class_id."""
     imgs = []
     loader = DataLoader(dataset, batch_size=128, shuffle=True, num_workers=0)
     total = 0
@@ -50,10 +54,7 @@ def _get_class_tensors(
 
 
 class _SyntheticDataset(torch.utils.data.Dataset):
-    """
-    Thin wrapper around the buffer's TensorDataset that returns
-    (x, y, task_label) triples so it matches Avalanche's expected format.
-    """
+    """Wraps buffer TensorDataset → returns (x, y_tensor, t_tensor)."""
     def __init__(self, tensor_dataset: TensorDataset):
         self.ds = tensor_dataset
 
@@ -69,7 +70,8 @@ class E2DReplayPlugin(SupervisedPlugin):
     def __init__(
         self,
         teacher: torch.nn.Module,
-        buffer_size:       int   = 200,
+        buffer_size:       int   = 50,
+        fixed_per_class:   bool  = True,
         distill_iters:     int   = 500,
         K:                 int   = 350,
         loss_threshold:    float = 0.5,
@@ -87,7 +89,10 @@ class E2DReplayPlugin(SupervisedPlugin):
     ):
         super().__init__()
         self.teacher           = teacher
-        self.buffer            = E2DBuffer(max_size=buffer_size)
+        self.buffer            = E2DBuffer(
+            max_size=buffer_size,
+            fixed_per_class=fixed_per_class,
+        )
         self.distill_iters     = distill_iters
         self.K                 = K
         self.loss_threshold    = loss_threshold
@@ -104,46 +109,36 @@ class E2DReplayPlugin(SupervisedPlugin):
         self.max_real_per_class= max_real_per_class
         self.seen_classes: Set[int] = set()
 
-    # ── THE FIX: override make_train_dataloader ───────────────────────────────
-    def make_train_dataloader(self, strategy, shuffle=True, **kwargs):
-        """
-        This hook IS the dataloader construction step.
-        Whatever we set as strategy.dataloader here is final —
-        nothing overwrites it afterwards.
-        We merge real data + synthetic buffer using plain PyTorch,
-        so this works with any version of Avalanche.
-        """
+    # ── Inject synthetic data before every epoch ──────────────────────────────
+    def before_training_epoch(self, strategy, **kwargs):
         syn_dataset = self.buffer.get_dataset()
-
         if syn_dataset is None:
-            # First experience: just build the standard dataloader
-            print("[E2DPlugin] First experience — no replay data yet.")
-            strategy.dataloader = DataLoader(
-                strategy.adapted_dataset,
-                batch_size=strategy.train_mb_size,
-                shuffle=shuffle,
-                num_workers=0,
-                drop_last=False,
-            )
             return
 
-        # Wrap synthetic data so it returns (x, y, task_label) like Avalanche
+        verbose = (strategy.clock.train_exp_epochs == 0)
+
         syn_wrapped = _SyntheticDataset(syn_dataset)
-        merged = ConcatDataset([strategy.adapted_dataset, syn_wrapped])
+        merged      = ConcatDataset([strategy.adapted_dataset, syn_wrapped])
 
-        print(f"[E2DPlugin] Injecting {len(syn_wrapped)} synthetic images. "
-              f"Total training samples: {len(merged)} "
-              f"({len(strategy.adapted_dataset)} real + {len(syn_wrapped)} synthetic)")
-
+        # Use _safe_collate to handle int vs tensor label mismatch
         strategy.dataloader = DataLoader(
             merged,
             batch_size=strategy.train_mb_size,
-            shuffle=shuffle,
+            shuffle=True,
             num_workers=0,
             drop_last=False,
+            collate_fn=_safe_collate,       # ← THE FIX
         )
 
-    # ── Distil new classes AFTER training finishes ────────────────────────────
+        if verbose:
+            print(
+                f"[E2DPlugin] Injecting {len(syn_wrapped)} synthetic images. "
+                f"Total: {len(merged)} "
+                f"({len(strategy.adapted_dataset)} real "
+                f"+ {len(syn_wrapped)} synthetic)"
+            )
+
+    # ── Distil after each experience ──────────────────────────────────────────
     def after_training_exp(self, strategy, **kwargs):
         exp           = strategy.experience
         new_classes   = list(exp.classes_in_this_experience)
@@ -153,20 +148,18 @@ class E2DReplayPlugin(SupervisedPlugin):
 
         print(
             f"\n[E2DPlugin] Distilling {len(new_classes)} new class(es): "
-            f"{new_classes} | total classes so far: {sorted(self.seen_classes)}"
+            f"{new_classes} | total seen: {sorted(self.seen_classes)}"
         )
 
         for class_id in new_classes:
-            print(f"  -> distilling class {class_id} "
-                  f"(target: {budget} synthetic images)...")
+            print(f"  -> class {class_id} | target: {budget} synthetic images")
 
             real_imgs = _get_class_tensors(
                 exp.dataset, int(class_id),
-                self.device, max_samples=self.max_real_per_class
+                self.device, max_samples=self.max_real_per_class,
             )
             if real_imgs.numel() == 0:
-                print(f"  [E2DPlugin] Warning: no images for class "
-                      f"{class_id}, skipping.")
+                print(f"  [E2DPlugin] Warning: no real images for class {class_id}.")
                 continue
 
             synthetic, stats = distill_task(
@@ -197,7 +190,7 @@ class E2DReplayPlugin(SupervisedPlugin):
             self.buffer.update(
                 int(class_id), synthetic,
                 total_classes,
-                task_id=int(exp.current_experience)
+                task_id=int(exp.current_experience),
             )
 
-        print(f"[E2DPlugin] Buffer state: {self.buffer}\n")
+        print(f"[E2DPlugin] Buffer: {self.buffer}\n")
