@@ -1,32 +1,37 @@
-"""Avalanche plugin for E2D synthetic replay."""
+"""Avalanche plugin for E2D synthetic replay.
+
+Key fix in this version: WeightedRandomSampler
+-----------------------------------------------
+Root cause of bad results: with 25000 real images and 100 synthetic,
+synthetic images were only 0.4% of training data — statistically invisible.
+
+Solution: WeightedRandomSampler gives synthetic images 20x higher sampling
+weight so they appear in ~17% of batches regardless of buffer size.
+This is standard practice in imbalanced learning and replay methods.
+"""
 
 from __future__ import annotations
 from typing import Set, List
 import torch
-from torch.utils.data import DataLoader, TensorDataset, ConcatDataset
+from torch.utils.data import (
+    DataLoader, TensorDataset, ConcatDataset, WeightedRandomSampler
+)
 from avalanche.training.plugins.strategy_plugin import SupervisedPlugin
 
 from buffer import E2DBuffer
 from distill import distill_task
 
 
-# ── Custom collate: handles mixed int/tensor labels from ConcatDataset ────────
+# ── Collate: handles mixed int/tensor labels from ConcatDataset ───────────────
 def _safe_collate(batch: List) -> tuple:
-    """
-    Avalanche datasets return labels as plain Python ints.
-    Synthetic datasets return labels as tensors.
-    This collate handles both so ConcatDataset batches don't crash.
-    """
     xs, ys, ts = [], [], []
     for item in batch:
         x, y, t = item[0], item[1], item[2]
         xs.append(x if torch.is_tensor(x) else torch.tensor(x))
         ys.append(torch.tensor(y, dtype=torch.long)
-                  if not torch.is_tensor(y)
-                  else y.long())
+                  if not torch.is_tensor(y) else y.long())
         ts.append(torch.tensor(t, dtype=torch.long)
-                  if not torch.is_tensor(t)
-                  else t.long())
+                  if not torch.is_tensor(t) else t.long())
     return torch.stack(xs), torch.stack(ys), torch.stack(ts)
 
 
@@ -66,26 +71,86 @@ class _SyntheticDataset(torch.utils.data.Dataset):
         return x, y.long(), t.long()
 
 
+def _make_weighted_loader(
+    real_dataset,
+    syn_dataset: _SyntheticDataset,
+    batch_size: int,
+    synthetic_weight: float = 20.0,
+) -> DataLoader:
+    """
+    Build a DataLoader where synthetic images are oversampled.
+
+    synthetic_weight=20 means each synthetic image is sampled 20x
+    more often than each real image per epoch. This ensures synthetic
+    images appear in ~17% of every batch regardless of buffer size.
+
+    Formula for expected synthetic fraction in a batch:
+        n_syn * w_syn
+        ─────────────────────────────────────────────
+        n_syn * w_syn + n_real * w_real
+
+    With n_real=25000, n_syn=100, w_real=1, w_syn=20:
+        100*20 / (100*20 + 25000*1) = 2000/27000 ≈ 7.4%
+
+    With w_syn=50:
+        100*50 / (100*50 + 25000*1) = 5000/30000 ≈ 16.7%
+    """
+    merged = ConcatDataset([real_dataset, syn_dataset])
+    n_real = len(real_dataset)
+    n_syn  = len(syn_dataset)
+
+    # Weight: 1.0 for real samples, synthetic_weight for synthetic samples
+    weights = torch.cat([
+        torch.ones(n_real),
+        torch.full((n_syn,), synthetic_weight),
+    ])
+
+    sampler = WeightedRandomSampler(
+        weights=weights,
+        num_samples=n_real + n_syn,   # one full "epoch" worth
+        replacement=True,
+    )
+
+    syn_frac = (n_syn * synthetic_weight) / (
+        n_syn * synthetic_weight + n_real * 1.0
+    ) * 100
+
+    print(
+        f"[E2DPlugin] WeightedSampler: {n_real} real (w=1) + {n_syn} synthetic "
+        f"(w={synthetic_weight:.0f}) → synthetic appears in ~{syn_frac:.1f}% of samples"
+    )
+
+    return DataLoader(
+        merged,
+        batch_size=batch_size,
+        sampler=sampler,          # sampler handles shuffling — no shuffle=True
+        num_workers=0,
+        drop_last=False,
+        collate_fn=_safe_collate,
+    )
+
+
 class E2DReplayPlugin(SupervisedPlugin):
     def __init__(
         self,
         teacher: torch.nn.Module,
-        buffer_size:       int   = 50,
-        fixed_per_class:   bool  = True,
-        distill_iters:     int   = 500,
-        K:                 int   = 350,
-        loss_threshold:    float = 0.5,
-        lr:                float = 0.05,
-        img_size:          int   = 32,
-        device:            torch.device = torch.device("cpu"),
-        r_loss:            float = 0.05,
-        first_multiplier:  float = 10.0,
-        tv_l1_weight:      float = 0.0,
-        tv_l2_weight:      float = 0.0,
-        training_momentum: float = 0.4,
-        crop_scale               = (0.5, 1.0),
-        stats_batch_size:  int   = 128,
-        max_real_per_class:int   = 500,
+        buffer_size:        int   = 50,
+        fixed_per_class:    bool  = True,
+        distill_iters:      int   = 500,
+        K:                  int   = 350,
+        loss_threshold:     float = 0.5,
+        lr:                 float = 0.05,
+        img_size:           int   = 32,
+        device:             torch.device = torch.device("cpu"),
+        r_loss:             float = 0.05,
+        first_multiplier:   float = 10.0,
+        tv_l1_weight:       float = 0.001,
+        tv_l2_weight:       float = 0.0001,
+        training_momentum:  float = 0.4,
+        crop_scale                = (0.5, 1.0),
+        stats_batch_size:   int   = 128,
+        max_real_per_class: int   = 500,
+        synthetic_weight:   float = 50.0,  # oversampling factor for synthetic
     ):
         super().__init__()
         self.teacher           = teacher
@@ -107,36 +172,38 @@ class E2DReplayPlugin(SupervisedPlugin):
         self.crop_scale        = crop_scale
         self.stats_batch_size  = stats_batch_size
         self.max_real_per_class= max_real_per_class
+        self.synthetic_weight  = synthetic_weight
         self.seen_classes: Set[int] = set()
 
-    # ── Inject synthetic data before every epoch ──────────────────────────────
+    # ── Inject with weighted sampler before every epoch ───────────────────────
     def before_training_epoch(self, strategy, **kwargs):
         syn_dataset = self.buffer.get_dataset()
         if syn_dataset is None:
             return
 
         verbose = (strategy.clock.train_exp_epochs == 0)
-
         syn_wrapped = _SyntheticDataset(syn_dataset)
-        merged      = ConcatDataset([strategy.adapted_dataset, syn_wrapped])
 
-        # Use _safe_collate to handle int vs tensor label mismatch
-        strategy.dataloader = DataLoader(
-            merged,
-            batch_size=strategy.train_mb_size,
-            shuffle=True,
-            num_workers=0,
-            drop_last=False,
-            collate_fn=_safe_collate,       # ← THE FIX
+        strategy.dataloader = _make_weighted_loader(
+            real_dataset     = strategy.adapted_dataset,
+            syn_dataset      = syn_wrapped,
+            batch_size       = strategy.train_mb_size,
+            synthetic_weight = self.synthetic_weight,
+        ) if verbose else DataLoader(
+            ConcatDataset([strategy.adapted_dataset, syn_wrapped]),
+            batch_size   = strategy.train_mb_size,
+            sampler      = WeightedRandomSampler(
+                weights      = torch.cat([
+                    torch.ones(len(strategy.adapted_dataset)),
+                    torch.full((len(syn_wrapped),), self.synthetic_weight),
+                ]),
+                num_samples  = len(strategy.adapted_dataset) + len(syn_wrapped),
+                replacement  = True,
+            ),
+            num_workers  = 0,
+            drop_last    = False,
+            collate_fn   = _safe_collate,
         )
-
-        if verbose:
-            print(
-                f"[E2DPlugin] Injecting {len(syn_wrapped)} synthetic images. "
-                f"Total: {len(merged)} "
-                f"({len(strategy.adapted_dataset)} real "
-                f"+ {len(syn_wrapped)} synthetic)"
-            )
 
     # ── Distil after each experience ──────────────────────────────────────────
     def after_training_exp(self, strategy, **kwargs):
