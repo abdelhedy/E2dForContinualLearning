@@ -1,43 +1,15 @@
-"""
-distill.py
-----------
-Fuller E2D distillation loop for continual learning on CIFAR-style images.
-
-This version keeps the original exploration/exploitation crop memory from
-recover.py, but also brings back the feature-stat matching term from
-recover.py/utils.py by collecting teacher BN/Conv statistics on the real
-images of the current class and matching them while optimizing the synthetic
-images.
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torchvision.transforms import functional as TF
 import torchvision.transforms as transforms
+from torchvision.transforms import functional as TF
 
 from utils import div_sixteen_mul, get_image_prior_losses, lr_cosine_policy
-
-
-def _channel_clip_bounds(reference: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Infer per-channel clipping bounds from the real images used to initialize."""
-    with torch.no_grad():
-        flat = reference.detach().permute(1, 0, 2, 3).reshape(reference.shape[1], -1)
-        lower = flat.min(dim=1).values.view(1, -1, 1, 1)
-        upper = flat.max(dim=1).values.view(1, -1, 1, 1)
-    return lower, upper
-
-
-def clip_like_reference(image_tensor: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:
-    lower, upper = _channel_clip_bounds(reference)
-    lower = lower.to(image_tensor.device, image_tensor.dtype)
-    upper = upper.to(image_tensor.device, image_tensor.dtype)
-    return torch.max(torch.min(image_tensor, upper), lower)
 
 
 @dataclass
@@ -51,13 +23,31 @@ class E2DStats:
 
 
 class ExplorationExploitationAug:
-    """Crop memory used by E2D during exploration then exploitation."""
+    """E2D crop memory with exploration then exploitation.
 
-    def __init__(self, batch_size: int, img_size: int = 32, crop_scale: Tuple[float, float] = (0.5, 1.0)):
+    Notes
+    -----
+    The released `recover.py` keeps a per-image high-loss crop memory and samples
+    crops independently for each image. That is what this implementation follows
+    by default because it matches the source code and preserves per-sample hard
+    region tracking.
+    """
+
+    def __init__(
+        self,
+        batch_size: int,
+        img_size: int = 32,
+        crop_scale: Tuple[float, float] = (0.5, 1.0),
+        same_crop_across_batch: bool = False,
+    ) -> None:
         self.cropper = transforms.RandomResizedCrop(img_size, scale=crop_scale)
         self.flipper = transforms.RandomHorizontalFlip()
+        self.same_crop_across_batch = same_crop_across_batch
         self.last_crops: List[Optional[Tuple[int, int, int, int]]] = [None] * batch_size
         self.selected_indices: List[Optional[int]] = [None] * batch_size
+
+    def _sample_random_crop(self, img: torch.Tensor) -> Tuple[int, int, int, int]:
+        return self.cropper.get_params(img, self.cropper.scale, self.cropper.ratio)
 
     def __call__(
         self,
@@ -68,15 +58,29 @@ class ExplorationExploitationAug:
         K: int,
     ) -> torch.Tensor:
         cropped_imgs: List[torch.Tensor] = []
+
+        shared_crop: Optional[Tuple[int, int, int, int]] = None
+        if self.same_crop_across_batch:
+            if iteration > K and high_loss_crops[0]:
+                weights = torch.tensor(high_loss_values[0], device=imgs.device, dtype=imgs.dtype)
+                probs = torch.softmax(weights, dim=0)
+                sel = torch.multinomial(probs, 1).item()
+                shared_crop = high_loss_crops[0][sel]
+            else:
+                shared_crop = self._sample_random_crop(imgs[0])
+
         for img_idx in range(imgs.shape[0]):
-            if iteration > K and high_loss_crops[img_idx]:
+            if shared_crop is not None:
+                i, j, h, w = shared_crop
+                self.selected_indices[img_idx] = 0 if iteration > K and high_loss_crops[img_idx] else None
+            elif iteration > K and high_loss_crops[img_idx]:
                 weights = torch.tensor(high_loss_values[img_idx], device=imgs.device, dtype=imgs.dtype)
                 probs = torch.softmax(weights, dim=0)
                 sel = torch.multinomial(probs, 1).item()
                 i, j, h, w = high_loss_crops[img_idx][sel]
                 self.selected_indices[img_idx] = sel
             else:
-                i, j, h, w = self.cropper.get_params(imgs[img_idx], self.cropper.scale, self.cropper.ratio)
+                i, j, h, w = self._sample_random_crop(imgs[img_idx])
                 self.selected_indices[img_idx] = None
 
             self.last_crops[img_idx] = (i, j, h, w)
@@ -124,8 +128,6 @@ class _BaseFeatureHook:
 
 
 class BNFeatureMatchingHook(_BaseFeatureHook):
-    """Adapted from BNFeatureHook in utils.py for per-class online stats."""
-
     def __init__(self, module: nn.Module, momentum: float = 0.4) -> None:
         super().__init__(module, momentum)
         self.target_mean: Optional[torch.Tensor] = None
@@ -171,8 +173,6 @@ class BNFeatureMatchingHook(_BaseFeatureHook):
 
 
 class ConvFeatureMatchingHook(_BaseFeatureHook):
-    """Adapted from ConvFeatureHook in utils.py for per-class online stats."""
-
     def __init__(self, module: nn.Module, momentum: float = 0.4) -> None:
         super().__init__(module, momentum)
         self.target_dd_mean: Optional[torch.Tensor] = None
@@ -276,17 +276,73 @@ def _feature_regularization(
     first_multiplier: float,
     device: torch.device,
 ) -> torch.Tensor:
-    if not hooks:
-        return torch.zeros((), device=device)
     losses: List[torch.Tensor] = []
     for idx, hook in enumerate(hooks):
         if hook.r_feature is None:
             continue
-        multiplier = first_multiplier if idx == 0 else 1.0
-        losses.append(hook.r_feature * multiplier)
+        losses.append(hook.r_feature * (first_multiplier if idx == 0 else 1.0))
     if not losses:
         return torch.zeros((), device=device)
     return torch.stack(losses).sum()
+
+
+def _channel_clip_bounds(reference: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    with torch.no_grad():
+        flat = reference.detach().permute(1, 0, 2, 3).reshape(reference.shape[1], -1)
+        lower = flat.min(dim=1).values.view(1, -1, 1, 1)
+        upper = flat.max(dim=1).values.view(1, -1, 1, 1)
+    return lower, upper
+
+
+def clip_like_reference(image_tensor: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:
+    lower, upper = _channel_clip_bounds(reference)
+    lower = lower.to(image_tensor.device, image_tensor.dtype)
+    upper = upper.to(image_tensor.device, image_tensor.dtype)
+    return torch.max(torch.min(image_tensor, upper), lower)
+
+
+def _random_augmented_view(
+    imgs: torch.Tensor,
+    crop_scale: Tuple[float, float],
+    same_crop_across_batch: bool,
+) -> torch.Tensor:
+    aug = ExplorationExploitationAug(
+        batch_size=imgs.shape[0],
+        img_size=imgs.shape[-1],
+        crop_scale=crop_scale,
+        same_crop_across_batch=same_crop_across_batch,
+    )
+    empty_crops: List[List[Tuple[int, int, int, int]]] = [[] for _ in range(imgs.shape[0])]
+    empty_vals: List[List[float]] = [[] for _ in range(imgs.shape[0])]
+    return aug(imgs, iteration=0, high_loss_crops=empty_crops, high_loss_values=empty_vals, K=0)
+
+
+@torch.no_grad()
+def relabel_synthetic_set(
+    images: torch.Tensor,
+    teacher: nn.Module,
+    device: torch.device,
+    n_views: int = 1,
+    temperature: float = 1.0,
+    crop_scale: Tuple[float, float] = (0.5, 1.0),
+    same_crop_across_batch: bool = False,
+) -> torch.Tensor:
+    """Teacher relabeling for replay.
+
+    CL adaptation of the original FKD relabeling pipeline: instead of saving an
+    epoch-long database of augmentation metadata, we average teacher logits over
+    a configurable number of stochastic views and store the resulting soft label.
+    """
+    teacher = teacher.to(device).eval()
+    images = images.to(device=device, dtype=torch.float32)
+    logits_acc = torch.zeros((images.shape[0], teacher(images[:1]).shape[1]), device=device)
+    for _ in range(max(1, n_views)):
+        view = images if n_views == 1 else _random_augmented_view(images, crop_scale, same_crop_across_batch)
+        logits_acc += teacher(view).float()
+    logits_acc /= float(max(1, n_views))
+    if temperature != 1.0:
+        logits_acc = logits_acc / temperature
+    return logits_acc.detach().cpu()
 
 
 def distill_task(
@@ -307,28 +363,18 @@ def distill_task(
     training_momentum: float = 0.4,
     crop_scale: Tuple[float, float] = (0.5, 1.0),
     stats_batch_size: int = 128,
+    same_crop_across_batch: bool = False,
     return_stats: bool = False,
 ):
-    """
-    Distill synthetic images for one class using the fuller E2D objective.
-
-    The implementation follows the original recover.py logic more closely than
-    the earlier lightweight version:
-      - full-image initialization from real images
-      - exploration/exploitation crop memory
-      - teacher CE objective on augmented views
-      - BN/Conv feature-stat regularization adapted from utils.py
-      - optional image prior losses
-      - cosine LR schedule during image optimization
-    """
-    teacher = teacher.to(device).eval()
-    for p in teacher.parameters():
-        p.requires_grad_(False)
-
     real_images = real_images.to(device=device, dtype=torch.float32)
     if real_images.shape[0] == 0:
         empty = torch.empty((0, 3, img_size, img_size), device=device)
-        return (empty, E2DStats(0.0, 0.0, 0.0, 0.0, 0.0, 0)) if return_stats else empty
+        result = (empty, E2DStats(0.0, 0.0, 0.0, 0.0, 0.0, 0))
+        return result if return_stats else empty
+
+    teacher = teacher.to(device).eval()
+    for p in teacher.parameters():
+        p.requires_grad_(False)
 
     hooks = _build_feature_hooks(teacher, momentum=training_momentum)
     try:
@@ -341,7 +387,12 @@ def distill_task(
         optimizer = optim.Adam([inputs], lr=lr, betas=(0.5, 0.9), eps=1e-8)
         lr_scheduler = lr_cosine_policy(lr, 0, max(1, iterations))
         criterion = nn.CrossEntropyLoss(reduction="none")
-        aug = ExplorationExploitationAug(n_synthetic, img_size=img_size, crop_scale=crop_scale)
+        aug = ExplorationExploitationAug(
+            n_synthetic,
+            img_size=img_size,
+            crop_scale=crop_scale,
+            same_crop_across_batch=same_crop_across_batch,
+        )
 
         high_loss_crops: List[List[Tuple[int, int, int, int]]] = [[] for _ in range(n_synthetic)]
         high_loss_values: List[List[float]] = [[] for _ in range(n_synthetic)]
@@ -367,7 +418,6 @@ def distill_task(
             loss_ce = loss_ce_all.mean()
             loss_r_feature = _feature_regularization(hooks, first_multiplier=first_multiplier, device=device)
             loss_var_l1, loss_var_l2 = get_image_prior_losses(inputs_aug)
-
             loss = loss_ce + r_loss * loss_r_feature + tv_l1_weight * loss_var_l1 + tv_l2_weight * loss_var_l2
             loss.backward()
             optimizer.step()
@@ -385,44 +435,37 @@ def distill_task(
                         high_loss_crops[img_idx].append(crop)
                         high_loss_values[img_idx].append(loss_vals[img_idx])
 
-                selected = aug.selected_indices[img_idx]
-                if selected is not None:
-                    new_loss = loss_vals[img_idx]
-                    if new_loss > loss_threshold:
-                        high_loss_values[img_idx][selected] = new_loss
+                sel = aug.selected_indices[img_idx]
+                if sel is not None and sel < len(high_loss_crops[img_idx]):
+                    if loss_vals[img_idx] > loss_threshold:
+                        high_loss_values[img_idx][sel] = loss_vals[img_idx]
                     else:
-                        del high_loss_crops[img_idx][selected]
-                        del high_loss_values[img_idx][selected]
+                        del high_loss_crops[img_idx][sel]
+                        del high_loss_values[img_idx][sel]
 
-            current_loss = float(loss.detach().item())
-            if current_loss < best_cost or iteration == 0:
-                best_cost = current_loss
+            current_cost = loss.item()
+            if current_cost < best_cost:
+                best_cost = current_cost
                 best_inputs = inputs.detach().clone()
 
             final_stats = E2DStats(
-                loss=current_loss,
-                loss_ce=float(loss_ce.detach().item()),
-                loss_r_feature=float(loss_r_feature.detach().item()),
-                loss_var_l1=float(loss_var_l1.detach().item()),
-                loss_var_l2=float(loss_var_l2.detach().item()),
+                loss=float(loss.item()),
+                loss_ce=float(loss_ce.item()),
+                loss_r_feature=float(loss_r_feature.item()) if torch.is_tensor(loss_r_feature) else float(loss_r_feature),
+                loss_var_l1=float(loss_var_l1.item()),
+                loss_var_l2=float(loss_var_l2.item()),
                 iterations=iteration + 1,
             )
 
             if iteration % 100 == 0 or iteration == iterations - 1:
                 print(
-                    "  [E2D] iter {:4d} | total {:.4f} | ce {:.4f} | feat {:.4f} | tv1 {:.4f} | tv2 {:.4f}".format(
-                        iteration,
-                        final_stats.loss,
-                        final_stats.loss_ce,
-                        final_stats.loss_r_feature,
-                        final_stats.loss_var_l1,
-                        final_stats.loss_var_l2,
-                    )
+                    f"  [E2D] iter {iteration:4d} | total {final_stats.loss:.4f} "
+                    f"| ce {final_stats.loss_ce:.4f} | feat {final_stats.loss_r_feature:.4f} "
+                    f"| tv1 {final_stats.loss_var_l1:.4f} | tv2 {final_stats.loss_var_l2:.4f}"
                 )
 
-        if return_stats:
-            return best_inputs.detach(), final_stats
-        return best_inputs.detach()
+        result = best_inputs.detach()
+        return (result, final_stats) if return_stats else result
     finally:
         for hook in hooks:
             hook.close()
