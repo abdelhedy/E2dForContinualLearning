@@ -1,6 +1,18 @@
-"""Main entry point for E2D-based continual learning on SplitCIFAR10."""
+"""Main entry point for E2D-based continual learning on SplitCIFAR10.
+
+This version applies a CL-friendly approximation of the paper's student-side
+training recipe:
+- AdamW globally (single optimizer for the whole model)
+- more epochs per experience (default 30)
+- an SSRS-like learning-rate schedule per experience
+- DIST as the default replay KD loss
+- a slightly smaller replay KD weight by default
+
+CutMix is intentionally left off in this run.
+"""
 
 import argparse
+import math
 import torch
 import torch.nn as nn
 import torchvision.models as tv_models
@@ -10,9 +22,54 @@ from avalanche.evaluation.metrics import accuracy_metrics, forgetting_metrics, l
 from avalanche.logging import InteractiveLogger
 from avalanche.training import Naive
 from avalanche.training.plugins import EvaluationPlugin, ReplayPlugin
+from avalanche.training.plugins.strategy_plugin import SupervisedPlugin
 
 from plugin import E2DReplayPlugin
 from teacher import load_cifar_teacher
+
+
+class SSRSLRSchedulerPlugin(SupervisedPlugin):
+    """Reset an SSRS-like LR schedule at each experience.
+
+    Phase 1 (smooth): cosine decay across the first ~80% of epochs.
+    Phase 2 (sharp): exponential drop across the final ~20% of epochs.
+    This approximates the paper's "smoothed then sharply reduced" idea while
+    remaining simple and robust in Avalanche's per-experience training loop.
+    """
+
+    def __init__(self, total_epochs: int, smooth_portion: float = 0.8, sharp_gamma: float = 0.35):
+        super().__init__()
+        self.total_epochs = max(1, int(total_epochs))
+        self.smooth_portion = float(smooth_portion)
+        self.sharp_gamma = float(sharp_gamma)
+        self.scheduler = None
+
+    def _make_lambda(self):
+        smooth_epochs = max(1, int(round(self.total_epochs * self.smooth_portion)))
+        sharp_epochs = max(1, self.total_epochs - smooth_epochs)
+        floor = 0.2
+
+        def lr_lambda(epoch_idx: int) -> float:
+            # epoch_idx starts at 0 and scheduler.step() is called after each epoch.
+            e = epoch_idx + 1
+            if e <= smooth_epochs:
+                progress = e / smooth_epochs
+                return floor + 0.5 * (1.0 - floor) * (1.0 + math.cos(math.pi * progress))
+            sharp_step = e - smooth_epochs
+            return floor * (self.sharp_gamma ** sharp_step)
+
+        return lr_lambda
+
+    def before_training_exp(self, strategy, **kwargs):
+        self.scheduler = torch.optim.lr_scheduler.LambdaLR(strategy.optimizer, lr_lambda=self._make_lambda())
+        current_lr = strategy.optimizer.param_groups[0]["lr"]
+        print(f"[SSRS] Reset scheduler for experience {strategy.experience.current_experience} | starting lr={current_lr:.6f}")
+
+    def after_training_epoch(self, strategy, **kwargs):
+        if self.scheduler is not None:
+            self.scheduler.step()
+            current_lr = strategy.optimizer.param_groups[0]["lr"]
+            print(f"[SSRS] Epoch {strategy.clock.train_exp_epochs} -> lr={current_lr:.6f}")
 
 
 def build_cifar_resnet18(num_classes: int = 10) -> nn.Module:
@@ -66,14 +123,34 @@ def run_strategy(strategy, benchmark, name: str) -> dict:
     return {"name": name, "final_acc": final_acc, "forgetting": forgetting}
 
 
+def make_optimizer(model: nn.Module, args) -> torch.optim.Optimizer:
+    return torch.optim.AdamW(
+        model.parameters(),
+        lr=args.lr,
+        betas=(0.9, 0.999),
+        weight_decay=args.weight_decay,
+    )
+
+
+def make_common_plugins(args):
+    return [
+        SSRSLRSchedulerPlugin(
+            total_epochs=args.epochs,
+            smooth_portion=args.ssrs_smooth_portion,
+            sharp_gamma=args.ssrs_sharp_gamma,
+        )
+    ]
+
+
 def main():
     parser = argparse.ArgumentParser(description="Faithful E2D-style continual learning on SplitCIFAR10")
     parser.add_argument("--buffer-size", type=int, default=50, help="E2D replay images per class when fixed-per-class is on")
     parser.add_argument("--fixed-per-class", action="store_true", default=True)
     parser.add_argument("--distill-iters", type=int, default=500)
     parser.add_argument("--K", type=int, default=350)
-    parser.add_argument("--epochs", type=int, default=15)
-    parser.add_argument("--lr", type=float, default=0.1)
+    parser.add_argument("--epochs", type=int, default=30, help="Per-experience epochs. 30-40 is a better fit for the stronger student schedule.")
+    parser.add_argument("--lr", type=float, default=1e-3, help="Global AdamW learning rate.")
+    parser.add_argument("--weight-decay", type=float, default=5e-4, help="Global AdamW weight decay.")
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--n-experiences", type=int, default=5)
@@ -81,6 +158,10 @@ def main():
     parser.add_argument("--strategy", type=str, default="all", choices=["all", "naive", "random", "e2d"])
     parser.add_argument("--student-arch", type=str, default="resnet50", choices=["resnet18", "resnet50"])
     parser.add_argument("--teacher-ckpt", type=str, default="./cifar_models/resnet50_cifar10_lr01.pth")
+
+    # SSRS-like student schedule
+    parser.add_argument("--ssrs-smooth-portion", type=float, default=0.8, help="Fraction of per-experience epochs used for the smooth LR phase.")
+    parser.add_argument("--ssrs-sharp-gamma", type=float, default=0.35, help="Per-epoch multiplier in the sharp reduction phase.")
 
     # E2D synthesis
     parser.add_argument("--e2d-lr", type=float, default=0.05)
@@ -99,8 +180,8 @@ def main():
     # Relabeling / replay KD
     parser.add_argument("--e2d-relabel-views", type=int, default=1)
     parser.add_argument("--e2d-relabel-temperature", type=float, default=1.0)
-    parser.add_argument("--e2d-kd-loss", type=str, default="kl", choices=["kl", "dist", "mse_gt"])
-    parser.add_argument("--e2d-kd-weight", type=float, default=1.0)
+    parser.add_argument("--e2d-kd-loss", type=str, default="dist", choices=["kl", "dist", "mse_gt"], help="Keep DIST as the default replay KD objective.")
+    parser.add_argument("--e2d-kd-weight", type=float, default=0.2, help="Slightly reduced replay KD weight for better plasticity.")
     parser.add_argument("--e2d-kd-temperature", type=float, default=4.0)
 
     args = parser.parse_args()
@@ -108,6 +189,11 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
     print(f"Device: {device}")
     print(f"Student architecture: {args.student_arch}")
+    print(f"Optimizer: AdamW | lr={args.lr} | weight_decay={args.weight_decay}")
+    print(
+        f"Student schedule: SSRS-like | epochs={args.epochs} | "
+        f"smooth_portion={args.ssrs_smooth_portion} | sharp_gamma={args.ssrs_sharp_gamma}"
+    )
     torch.manual_seed(args.seed)
 
     benchmark = SplitCIFAR10(
@@ -119,9 +205,11 @@ def main():
     num_classes = 10
     results_table = []
 
+    common_plugins = make_common_plugins(args)
+
     if args.strategy in ("all", "naive"):
         model = build_student(args.student_arch, num_classes).to(device)
-        optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.9, weight_decay=1e-4)
+        optimizer = make_optimizer(model, args)
         strategy = Naive(
             model=model,
             optimizer=optimizer,
@@ -131,12 +219,13 @@ def main():
             eval_mb_size=256,
             device=device,
             evaluator=build_evaluator(),
+            plugins=list(common_plugins),
         )
         results_table.append(run_strategy(strategy, benchmark, "Naive"))
 
     if args.strategy in ("all", "random"):
         model = build_student(args.student_arch, num_classes).to(device)
-        optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.9, weight_decay=1e-4)
+        optimizer = make_optimizer(model, args)
         mem_size = args.buffer_size * num_classes if args.fixed_per_class else args.buffer_size
         strategy = Naive(
             model=model,
@@ -147,7 +236,7 @@ def main():
             eval_mb_size=256,
             device=device,
             evaluator=build_evaluator(),
-            plugins=[ReplayPlugin(mem_size=mem_size)],
+            plugins=list(common_plugins) + [ReplayPlugin(mem_size=mem_size)],
         )
         results_table.append(run_strategy(strategy, benchmark, "RandomReplay"))
 
@@ -180,7 +269,7 @@ def main():
             same_crop_across_batch=args.e2d_same_crop_across_batch,
         )
         model = build_student(args.student_arch, num_classes).to(device)
-        optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.9, weight_decay=1e-4)
+        optimizer = make_optimizer(model, args)
         strategy = Naive(
             model=model,
             optimizer=optimizer,
@@ -190,7 +279,7 @@ def main():
             eval_mb_size=256,
             device=device,
             evaluator=build_evaluator(),
-            plugins=[e2d_plugin],
+            plugins=list(common_plugins) + [e2d_plugin],
         )
         results_table.append(run_strategy(strategy, benchmark, "E2DReplay"))
 
